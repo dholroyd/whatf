@@ -1,0 +1,11 @@
+[package]
+name = "whatf"
+version = "0.1.0"
+authors = ["David Holroyd <dave@badgers-in-foil.co.uk>"]
+
+[dependencies]
+time = "0.1.36"
+flate2 = "0.2"
+chan = "0.1.19"
+glob = "0.2.11"
+deque = "0.3.1"
