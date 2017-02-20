@@ -7,13 +7,14 @@ extern crate urlparse;
 #[macro_use] extern crate lazy_static;
 
 mod parse_access_log;
+mod process;
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::fs::File;
 use flate2::read::GzDecoder;
 use parse_access_log::HttpdAccessLogParser;
-use parse_access_log::Consumer;
+use process::Consumer;
 use glob::glob;
 use std::time::Instant;
 use std::thread;
@@ -47,7 +48,7 @@ fn process(fileglob: &str) -> Result<(), std::io::Error> {
             let work_count = work_count.clone();
             let fileglob = fileglob.to_string();
             thread::spawn (move || {
-                let mut lim = 200;
+                let mut lim = 2000000;
                 let mut matched = false;
                 for entry in glob(&fileglob).expect("Failed to read glob pattern") {
                     match entry {
