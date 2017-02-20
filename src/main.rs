@@ -2,6 +2,9 @@ extern crate time;
 extern crate flate2;
 extern crate glob;
 extern crate chan;
+extern crate regex;
+extern crate urlparse;
+#[macro_use] extern crate lazy_static;
 
 mod parse_access_log;
 
@@ -94,8 +97,14 @@ fn process(fileglob: &str) -> Result<(), std::io::Error> {
         completed += 1;
         println!("{} completed ({} known left)", completed, remaining_work);
     }
-    let mut f = try!(File::create("report.tsv"));
-    reduced.dump(&mut f)?;
+    {
+        let mut f = File::create("by_status_timeslice.tsv")?;
+        reduced.dump_by_status_timeslice(&mut f)?;
+    }
+    {
+        let mut f = File::create("by_uritype_timeslice.tsv")?;
+        reduced.dump_by_uritype_timeslice(&mut f)?;
+    }
     Ok(())
 }
 
@@ -113,4 +122,3 @@ fn main() {
         None => println!("missing fileglob argument"),
     }
 }
-
