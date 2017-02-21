@@ -5,6 +5,7 @@ extern crate chan;
 extern crate regex;
 extern crate urlparse;
 #[macro_use] extern crate lazy_static;
+extern crate hdrsample;
 
 mod parse_access_log;
 mod process;
@@ -105,6 +106,10 @@ fn process(fileglob: &str) -> Result<(), std::io::Error> {
     {
         let mut f = File::create("by_uritype_timeslice.tsv")?;
         reduced.dump_by_uritype_timeslice(&mut f)?;
+    }
+    {
+        let mut f = File::create("servicetime_by_timeslice.tsv")?;
+        reduced.dump_servicetimes_by_timeslice(&mut f)?;
     }
     Ok(())
 }

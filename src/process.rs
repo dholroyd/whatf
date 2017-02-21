@@ -5,6 +5,7 @@ use regex::RegexSet;
 use parse_access_log::Record;
 use std::io::Error;
 use time::Timespec;
+use hdrsample::Histogram;
 
 #[derive(Debug,Clone,Copy,Hash,Eq,PartialEq)]
 enum UriType {
@@ -66,6 +67,8 @@ struct KeyUritypeTimeslice {
 }
 
 pub struct Consumer {
+    servicetime_hist_by_timeslice: HashMap<i64,Histogram<u64>>,
+    servicetime_hist: Histogram<u64>,
     by_status_timeslice: HashMap<KeyStatusTimeslice,u64>,
     timeslices: HashSet<i64>,
     statuses: HashSet<String>,
@@ -76,6 +79,8 @@ pub struct Consumer {
 impl Consumer {
     pub fn new() -> Consumer {
         Consumer {
+            servicetime_hist_by_timeslice: HashMap::new(),
+            servicetime_hist: Histogram::new(1).unwrap(),
             by_status_timeslice: HashMap::new(),
             by_uritype_timeslice: HashMap::new(),
             timeslices: HashSet::new(),
@@ -84,16 +89,22 @@ impl Consumer {
         }
     }
     pub fn handle(&mut self, r: Record) {
-        let slice = timeslice(r.timestamp, 300);
+        let slice = timeslice(r.timestamp, 1200);
+        self.timeslices.insert(slice);
+        self.record_http_status(slice, r.response_status);
+        self.record_uritype(slice, &r.request_uri);
+        self.record_service_time(slice, r.response_time_micros);
+    }
+    fn record_http_status(&mut self, slice: i64, response_status: String) {
         let key_status_timeslice = KeyStatusTimeslice {
             timeslice: slice,
-            http_status: r.response_status.clone(),
+            http_status: response_status.clone(),
         };
         *self.by_status_timeslice.entry(key_status_timeslice).or_insert(0) += 1;
-        self.timeslices.insert(slice);
-        self.statuses.insert(r.response_status);
-
-        let uritype = classify(&r.request_uri);
+        self.statuses.insert(response_status);
+    }
+    fn record_uritype(&mut self, slice: i64, request_uri: &str) {
+        let uritype = classify(request_uri);
         let key_uritype_timeslice = KeyUritypeTimeslice {
             timeslice: slice,
             uritype: uritype,
@@ -101,10 +112,16 @@ impl Consumer {
         *self.by_uritype_timeslice.entry(key_uritype_timeslice).or_insert(0) += 1;
         self.uritypes.insert(uritype);
     }
+    fn record_service_time(&mut self, slice: i64, response_time_micros: u64) {
+        self.servicetime_hist_by_timeslice.entry(slice).or_insert_with(|| Histogram::new(1).unwrap()).record(response_time_micros);
+        self.servicetime_hist.record(response_time_micros);
+    }
 
     pub fn merge(&mut self, other: &Consumer) {
         for timeslice in other.timeslices.iter() {
             self.timeslices.insert(*timeslice);
+            let other_times = other.servicetime_hist_by_timeslice.get(timeslice).unwrap();
+            self.servicetime_hist_by_timeslice.entry(*timeslice).or_insert_with(|| Histogram::new(1).unwrap()).add(other_times);
         }
         for status in other.statuses.iter() {
             self.statuses.insert(status.clone());
@@ -118,6 +135,7 @@ impl Consumer {
         for (k, v) in other.by_uritype_timeslice.iter() {
             *self.by_uritype_timeslice.entry(k.clone()).or_insert(0) += *v;
         }
+        self.servicetime_hist.add(&other.servicetime_hist);
     }
 
     pub fn dump_by_status_timeslice(&self, out: &mut Write) -> Result<(),Error>{
@@ -164,6 +182,26 @@ impl Consumer {
                 let def = 0;
                 let val = self.by_uritype_timeslice.get(&key).unwrap_or(&def);
                 write!(out, "{}\t", val)?;
+            }
+            writeln!(out, "")?;
+        }
+        Ok(())
+    }
+
+    pub fn dump_servicetimes_by_timeslice(&self, out: &mut Write) -> Result<(),Error>{
+        let cols = self.servicetime_hist.iter_recorded().map(|v| v.value()).collect::<Vec<u64>>();
+        write!(out, "timeslice")?;
+        for c in &cols {
+            write!(out, "\t{:?}", c)?;
+        }
+        writeln!(out, "")?;
+        let mut timeslices = self.timeslices.iter().map(|ts| *ts ).collect::<Vec<i64>>();
+        timeslices.sort();
+        for ts in timeslices.iter() {
+            write!(out, "{}\t", ts)?;
+            let hist = self.servicetime_hist_by_timeslice.get(ts).unwrap();
+            for c in &cols {
+                write!(out, "{}\t", hist.count_at(*c).unwrap())?;
             }
             writeln!(out, "")?;
         }
