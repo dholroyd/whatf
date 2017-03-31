@@ -113,6 +113,11 @@ impl HttpdAccessLogParser {
             let request_local_port: u32 = string_from_slice(port)?.parse().map_err(|_| invalid_data("port"))?;
             let response_cache_status = expect_field_ws(&buf, &mut idx).ok_or(invalid_data("cache-status"))?;
             let request_handler = expect_field_ws(&buf, &mut idx).ok_or(invalid_data("handler"))?;
+            let decoded_uri = urlparse::unquote(request_uri)
+                .unwrap_or_else(|e| {
+                    println!("failed to urldecode request uri {:?}", e);
+                    request_uri.to_string()
+                });
 
             consumer.handle(Record{
                 timestamp: line_date.unwrap(),
@@ -120,7 +125,7 @@ impl HttpdAccessLogParser {
                 remote_logname: string_from_slice(remote_logname)?.to_string(),
                 remote_user: string_from_slice(remote_user)?.to_string(),
                 request_method: request_method.to_string(),
-                request_uri: urlparse::unquote(request_uri).map_err(|_| invalid_data("failed to urldecode request uri"))?,
+                request_uri: decoded_uri,
                 request_proto: request_proto.to_string(),
                 response_status: string_from_slice(response_status)?.to_string(),
                 response_bytes: response_bytes,

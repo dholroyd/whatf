@@ -13,3 +13,12 @@ regex = "0.2.1"
 lazy_static = "0.2.2"
 urlparse = "0.7.3"
 hdrsample = "3.0"
+rusoto = { version = "0.22.0", features = [ "s3" ] }
+hyper = "0.10.4"
+toml = "0.3"
+serde = "0.9.12"
+serde_derive = "0.9.12"
+nom = { version = "2.1.0", features = [ "verbose-errors" ] }
+clap = "2.19"
+log = "0.3.6"
+env_logger = "0.4.2"
