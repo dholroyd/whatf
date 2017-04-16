@@ -14,7 +14,11 @@ lazy_static = "0.2.2"
 urlparse = "0.7.3"
 hdrsample = "3.0"
 rusoto = { version = "0.22.0", features = [ "s3" ] }
-hyper = "0.10.4"
+hyper = { git = "https://github.com/hyperium/hyper.git" }
+hyper-tls = { git = "https://github.com/hyperium/hyper-tls.git" }
+futures = "0.1.11"
+xml-rs = "0.3"
+tokio-core = "0.1.6"
 toml = "0.3"
 serde = "0.9.12"
 serde_derive = "0.9.12"

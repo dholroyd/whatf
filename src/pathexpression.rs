@@ -10,8 +10,11 @@ use time;
 use std::collections::HashSet;
 use std::env;
 
+use rusoto_workarounds;
+use rusoto_workarounds::s3::S3ClientWorkarounds;
+use rusoto_workarounds::request::DispatchSignedRequestWorkaround;
 use rusoto::s3;
-use rusoto::{ProvideAwsCredentials, DispatchSignedRequest};
+use rusoto::ProvideAwsCredentials;
 
 
 #[derive(Debug)]
@@ -106,15 +109,15 @@ impl Iterator for ListLocal {
 
 
 /// No retries implemented by rusoto or hyper, so implement retrying here
-fn list_objects<P,D>(client: &s3::S3Client<P,D>, req: &s3::ListObjectsRequest) -> Result<s3::ListObjectsOutput, s3::ListObjectsError>
-    where P: ProvideAwsCredentials, D: DispatchSignedRequest
+fn list_objects<P,D>(client: &S3ClientWorkarounds<P,D>, req: &s3::ListObjectsRequest) -> Result<s3::ListObjectsOutput, rusoto_workarounds::s3::ListObjectsError>
+    where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
 {
     let mut tries = 3;
     loop {
         let resp = client.list_objects(&req);
         match &resp {
             &Err(ref e) => match e {
-                &s3::ListObjectsError::HttpDispatch(_) => (),
+                &rusoto_workarounds::s3::ListObjectsError::HttpDispatch(_) => (),
                 _ => tries = 0,
             },
             _ => tries = 0,
@@ -128,9 +131,9 @@ fn list_objects<P,D>(client: &s3::S3Client<P,D>, req: &s3::ListObjectsRequest) -
 
 
 pub struct ListS3<P,D>
-    where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
 {
-    client: s3::S3Client<P,D>,
+    client: S3ClientWorkarounds<P,D>,
     bucket: String,
     pathexp: PathExpression,
     prefix: String,
@@ -141,10 +144,10 @@ pub struct ListS3<P,D>
 }
 
 impl <P,D> ListS3<P,D>
-    where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
 {
-    fn new(client: s3::S3Client<P,D>, bucket: &str, pathexp: PathExpression) -> ListS3<P,D>
-        where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    fn new(client: S3ClientWorkarounds<P,D>, bucket: &str, pathexp: PathExpression) -> ListS3<P,D>
+        where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
     {
         ListS3 {
             client: client,
@@ -193,7 +196,7 @@ impl <P,D> ListS3<P,D>
 }
 
 impl <P,D> Iterator for ListS3<P,D>
-    where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
 {
     type Item = Result<s3::Object, GlobError>;
 
@@ -239,9 +242,9 @@ impl <P,D> Iterator for ListS3<P,D>
 }
 
 pub struct SpecialiseS3<P,D>
-    where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
 {
-    client: s3::S3Client<P,D>,
+    client: S3ClientWorkarounds<P,D>,
     bucket: String,
     pathexp: PathExpression,
     first_with_variable: PathElement,
@@ -257,10 +260,10 @@ pub struct SpecialiseS3<P,D>
 //       when the time range covers multiple days etc?
 
 impl <P,D> SpecialiseS3<P,D>
-    where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
 {
-    fn new(client: s3::S3Client<P,D>, bucket: &str, pathexp: PathExpression, ctx: MatchContext) -> SpecialiseS3<P,D>
-        where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    fn new(client: S3ClientWorkarounds<P,D>, bucket: &str, pathexp: PathExpression, ctx: MatchContext) -> SpecialiseS3<P,D>
+        where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
     {
         SpecialiseS3 {
             client: client,
@@ -343,7 +346,7 @@ fn create_specialised(pathexp: &PathExpression, literal_val: &str) -> PathExpres
 }
 
 impl <P,D> Iterator for SpecialiseS3<P,D>
-    where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
 {
     type Item = Result<PathExpression, GlobError>;
 
@@ -817,16 +820,16 @@ impl PathExpression {
     }
 
     // TODO: return Result and bail-out early for up front problems,
-    pub fn list_s3<P, D>(&self, client: s3::S3Client<P, D>, bucket: &str, opts: PathMatchOptions) -> ListS3<P,D>
-        where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    pub fn list_s3<P, D>(&self, client: S3ClientWorkarounds<P, D>, bucket: &str, opts: PathMatchOptions) -> ListS3<P,D>
+        where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
     {
         let specialised = self.with(opts.clone());
         ListS3::new(client, bucket, specialised)
     }
 
     // TODO: return Result and bail-out early for up front problems,
-    pub fn specialise_first_element<P, D>(&self, client: s3::S3Client<P, D>, bucket: &str, opts: PathMatchOptions) -> SpecialiseS3<P,D>
-        where P: ProvideAwsCredentials, D: DispatchSignedRequest
+    pub fn specialise_first_element<P, D>(&self, client: S3ClientWorkarounds<P, D>, bucket: &str, opts: PathMatchOptions) -> SpecialiseS3<P,D>
+        where P: ProvideAwsCredentials, D: DispatchSignedRequestWorkaround
     {
         let specialised = self.with(opts.clone());
         let ctx = MatchContext::new(&opts);
@@ -931,8 +934,7 @@ mod tests {
     use std::time::Duration;
 
     use rusoto::{DefaultCredentialsProvider, Region};
-    use rusoto::s3::S3Client;
-    use rusoto::default_tls_client;
+    use rusoto_workarounds::s3::S3ClientWorkarounds;
     use self::hyper::client::Client;
 
     #[test]

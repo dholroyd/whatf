@@ -7,6 +7,7 @@ extern crate urlparse;
 extern crate hdrsample;
 extern crate rusoto;
 extern crate hyper;
+extern crate hyper_tls;
 #[macro_use]
 extern crate nom;
 #[macro_use]
@@ -16,6 +17,9 @@ extern crate env_logger;
 extern crate toml;
 #[macro_use]
 extern crate serde_derive;
+extern crate tokio_core;
+extern crate futures;
+extern crate xml;
 
 mod parse_access_log;
 mod process;
@@ -29,7 +33,7 @@ use std::fs::File;
 use flate2::read::GzDecoder;
 use parse_access_log::HttpdAccessLogParser;
 use process::Consumer;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use std::thread;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -39,13 +43,15 @@ use time::strptime;
 use pathexpression::{PathExpression,PathMatchOptions};
 use rusoto::s3;
 use rusoto::{DefaultCredentialsProvider, Region};
-use rusoto::s3::S3Client;
 use rusoto_workarounds::s3::S3ClientWorkarounds;
-use rusoto::default_tls_client;
 use hyper::client::Client;
-use std::time::Duration;
+use hyper_tls::HttpsConnector;
 use hyper::header::ContentType;
 use hyper::mime;
+use tokio_core::reactor::{Core, Handle, Timeout};
+use futures::Stream;
+use futures::Future;
+use futures::future;
 
 fn process_file(name: &Path, consumer: &mut Consumer) -> Result<(), std::io::Error> {
     let parser = HttpdAccessLogParser::new();
@@ -60,29 +66,50 @@ fn process_file(name: &Path, consumer: &mut Consumer) -> Result<(), std::io::Err
 }
 
 fn is_gzip(key: &str, resp: &hyper::client::Response) -> bool {
-    if let Some(&ContentType(hyper::mime::Mime(mime::TopLevel::Application, mime::SubLevel::Ext(ref ext), _))) = resp.headers.get() {
+    if let Some(&ContentType(hyper::mime::Mime(mime::TopLevel::Application, mime::SubLevel::Ext(ref ext), _))) = resp.headers().get() {
         ext=="gzip"
-    } else if let Some(&ContentType(hyper::mime::Mime(mime::TopLevel::Ext(ref ext), mime::SubLevel::OctetStream, _))) = resp.headers.get() {
+    } else if let Some(&ContentType(hyper::mime::Mime(mime::TopLevel::Ext(ref ext), mime::SubLevel::OctetStream, _))) = resp.headers().get() {
         ext=="binary" && key.ends_with(".gz")
     } else {
         false
     }
 }
 
-fn process_s3obj(client: &S3ClientWorkarounds<DefaultCredentialsProvider,Arc<Client>>, bucket: &str, obj: &s3::Object, consumer: &mut Consumer) -> Result<(), std::io::Error> {
+fn process_s3obj(mut core: &mut Core,
+                 client: &S3ClientWorkarounds<DefaultCredentialsProvider,Client<HttpsConnector>>,
+                 bucket: &str,
+                 obj: &s3::Object,
+                 consumer: &mut Consumer) -> Result<(), std::io::Error>
+{
     let parser = HttpdAccessLogParser::new();
     let mut req = s3::GetObjectRequest::default();
     req.bucket = bucket.to_string();
     req.key = obj.key.clone().unwrap();
-    let resp = client
+    let result = client
         .get_object(&req)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    if is_gzip(&req.key, &resp) {
-        let gunzip = GzDecoder::new(resp)?;
-        parser.process_lines(gunzip, consumer)
-    } else {
-        parser.process_lines(resp, consumer)
-    }
+        .map_err(|e| {println!("map_err 1"); std::io::Error::new(std::io::ErrorKind::Other, e) })?
+        .map_err(|e| {println!("map_err 2"); std::io::Error::new(std::io::ErrorKind::Other, e) });
+    let process = result.and_then(|resp| {
+        let is_gzip = is_gzip(&req.key, &resp);
+        let future_body = resp.body()
+            .map_err(|_| {println!("map_err 3"); std::io::Error::new(std::io::ErrorKind::Other, "failure reading response body".to_string()) })
+            .map(|chunk| chunk.to_vec(/*TODO: avoid this copy*/) )
+            .concat();
+        future_body.and_then(move |body| {
+            if is_gzip {
+                let gunzip = GzDecoder::new(&body[..])?;
+                parser.process_lines(gunzip, consumer)
+            } else {
+                parser.process_lines(&body[..], consumer)
+            }
+        })
+    });
+    let timeout = Timeout::new(Duration::new(10, 0), &core.handle())?
+        .then(|r| match r {Err(e)=>future::err(e), Ok(_)=>future::err(std::io::Error::new(std::io::ErrorKind::Other, "request timed out"))} );
+    let with_timeout = process
+        .map_err(|e| {println!("map_err 4"); std::io::Error::new(std::io::ErrorKind::Other, e) })
+        .select(timeout);
+    core.run(with_timeout).map(|(select_ok, _)| select_ok ).map_err(|(select_err, _)| select_err)
 }
 
 enum Action {
@@ -141,12 +168,10 @@ fn process_files(exp: PathExpression, options: PathMatchOptions) -> Result<(), s
         result_recv
     };
     let mut reduced = Consumer::new();
-    let mut completed: usize = 0;
-    for result in result_recv {
+    for (completed, result) in result_recv.iter().enumerate() {
         let remaining_work = work_count.fetch_sub(1, Ordering::AcqRel);
         reduced.merge(&result);
-        completed += 1;
-        println!("{} completed ({} known left)", completed, remaining_work);
+        println!("{} completed ({} known left)", completed+1, remaining_work);
     }
     {
         let mut f = File::create("by_status_timeslice.tsv")?;
@@ -163,14 +188,13 @@ fn process_files(exp: PathExpression, options: PathMatchOptions) -> Result<(), s
     Ok(())
 }
 
-fn s3client(region: Region) -> S3Client<DefaultCredentialsProvider,Client> {
-    let provider = DefaultCredentialsProvider::new().unwrap();
-    let mut http_client = default_tls_client().unwrap();
-    http_client.set_read_timeout(Some(Duration::from_secs(5)));
-    S3Client::new(http_client, provider, region)
+fn http_client(handle: &Handle) -> Result<Client<HttpsConnector>, std::io::Error> {
+    Ok(hyper::Client::configure()
+        .connector(hyper_tls::HttpsConnector::new(4, handle))
+        .build(handle))
 }
 
-fn s3client_workarounds(region: Region, http_client: Arc<Client>) -> S3ClientWorkarounds<DefaultCredentialsProvider,Arc<Client>> {
+fn s3client(region: Region, http_client: Client<HttpsConnector>) -> S3ClientWorkarounds<DefaultCredentialsProvider,Client<HttpsConnector>> {
     let provider = DefaultCredentialsProvider::new().unwrap();
     S3ClientWorkarounds::new(http_client, provider, region)
 }
@@ -184,7 +208,10 @@ fn process_s3(region: Region, bucket: &str, pathexp: PathExpression, options: Pa
             let bucket = bucket.to_string();
             let options = options.clone();
             thread::spawn (move || {
-                let client = s3client(region);
+                let core = Core::new().unwrap();
+                let handle = core.handle();
+                let http_client = http_client(&handle).unwrap();
+                let client = s3client(region, http_client);
                 let mut lim = 2000000;
                 let mut matched = false;
                 for se in pathexp.specialise_first_element(client, &bucket, options.clone()) {
@@ -216,8 +243,11 @@ fn process_s3(region: Region, bucket: &str, pathexp: PathExpression, options: Pa
                 let options = options.clone();
                 let work_count = work_count.clone();
                 thread::spawn(move || {
+                    let core = Core::new().unwrap();
+                    let handle = core.handle();
+                    let http_client = http_client(&handle).unwrap();
                     for pathexp in pathexp_recv {
-                        let client = s3client(region);
+                        let client = s3client(region, http_client.clone());
                         for list_entry in pathexp.list_s3(client, &bucket, options.clone()) {
                             match list_entry {
                                 Ok(obj) => {
@@ -232,20 +262,19 @@ fn process_s3(region: Region, bucket: &str, pathexp: PathExpression, options: Pa
             }
         }
         let (result_send, result_recv) = chan::async();
-        let mut http = default_tls_client().unwrap();
-        http.set_read_timeout(Some(Duration::from_secs(5)));
-        let shared_http_client = Arc::new(http);
         for _ in 0..7 {
             let s3obj_recv = s3obj_recv.clone();
             let result_send = result_send.clone();
             let bucket = bucket.to_string();
-            let http_client = shared_http_client.clone();
             thread::spawn(move || {
-                let client = s3client_workarounds(region, http_client);
+                let mut core = Core::new().unwrap();
+                let handle = core.handle();
+                let http_client = http_client(&handle).unwrap();
+                let client = s3client(region, http_client);
                 for obj in s3obj_recv {
                     let mut consumer = Consumer::new();
                     let time = Instant::now();
-                    process_s3obj(&client, &bucket, &obj, &mut consumer).unwrap();
+                    process_s3obj(&mut core, &client, &bucket, &obj, &mut consumer).unwrap();
                     let elapsed = time.elapsed();
                     let elapsed = elapsed.as_secs() * 1000 + elapsed.subsec_nanos() as u64 / 1000000;
                     println!("{} ({}ms)", obj.key.unwrap(), elapsed);
@@ -256,12 +285,10 @@ fn process_s3(region: Region, bucket: &str, pathexp: PathExpression, options: Pa
         result_recv
     };
     let mut reduced = Consumer::new();
-    let mut completed: usize = 0;
-    for result in result_recv {
+    for (completed, result) in result_recv.iter().enumerate() {
         let remaining_work = work_count.fetch_sub(1, Ordering::AcqRel);
         reduced.merge(&result);
-        completed += 1;
-        println!("{} completed ({} known left)", completed, remaining_work);
+        println!("{} completed ({} known left)", completed+1, remaining_work);
     }
     {
         let mut f = File::create("by_status_timeslice.tsv")?;
@@ -322,7 +349,7 @@ fn main() {
         let expr = PathExpression::parse(&s3source.pathexp).unwrap();
         let time = Instant::now();
         let region = s3source.region.parse::<Region>();
-        if let Err(_) = region {
+        if region.is_err() {
             println!("Invalid AWS region: {:?}", s3source.region);
             return;
         }
